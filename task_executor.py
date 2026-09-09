@@ -460,6 +460,46 @@ def send_discord_notification(webhook_url, wallet_name, wallet_address, action, 
         click.echo(f"Error sending Discord notification: {e}")
 
 
+# Caps how many BUY alerts and how many SELL alerts we'll ever send for the
+# same token (counted separately, so a token can generate at most 2 buy alerts
+# + 2 sell alerts) - stops a token that gets traded rapidly/repeatedly from
+# flooding the channel. Lives only in memory - resets if the process restarts.
+_alert_counts = {}
+_alert_counts_lock = threading.Lock()
+MAX_ALERTS_PER_TOKEN_PER_ACTION = 2
+
+
+def _should_send_alert(token_mint, action):
+    """True (and increments the counter) only while under the per-token/per-action cap."""
+    with _alert_counts_lock:
+        key = (token_mint, action)
+        count = _alert_counts.get(key, 0)
+        if count >= MAX_ALERTS_PER_TOKEN_PER_ACTION:
+            return False
+        _alert_counts[key] = count + 1
+        return True
+
+
+def _should_send_swap_alert(sold_mint, bought_mint):
+    """
+    Same per-token/per-action cap as _should_send_alert, but for a token-to-token
+    swap message that covers two tokens at once (a SOLD slot on the sold mint and
+    a BOUGHT slot on the bought mint). Both slots are checked before either is
+    consumed, so a swap that would only be capped on one side doesn't burn a slot
+    on the other side while still getting suppressed.
+    """
+    with _alert_counts_lock:
+        sold_key = (sold_mint, "SOLD")
+        bought_key = (bought_mint, "BOUGHT")
+        sold_count = _alert_counts.get(sold_key, 0)
+        bought_count = _alert_counts.get(bought_key, 0)
+        if sold_count >= MAX_ALERTS_PER_TOKEN_PER_ACTION or bought_count >= MAX_ALERTS_PER_TOKEN_PER_ACTION:
+            return False
+        _alert_counts[sold_key] = sold_count + 1
+        _alert_counts[bought_key] = bought_count + 1
+        return True
+
+
 def notify(alerts_config, action, wallet_name, wallet_address, token_info, token_mint,
            token_amount, sol_amount, signature=None):
     """
@@ -497,6 +537,15 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
                 f"[SolTracker] USD/SOL value mismatch for {wallet_name} ({token_mint}): "
                 f"token-price ${usd_value:,.2f} vs sol-leg ${sol_usd_value:,.2f}{sig_note}"
             )
+            # When the SOL leg is the much smaller (and thus the clearly-broken) side,
+            # it's almost always because extract_sol_amount only caught the network fee
+            # and missed the real proceeds/cost - e.g. some pump.fun-routed trades move
+            # SOL through an account extract_sol_amount doesn't recognize as the wallet's.
+            # Rather than alert with an obviously-wrong dust amount (like "0.0001 SOL" on
+            # a $551 sale), fall back to a SOL amount implied by the token's own USD value.
+            if usd_value > sol_usd_value and sol_price:
+                sol_amount = usd_value / sol_price
+                sol_usd_value = usd_value
 
     pnl_usd = None
     pnl_pct = None
@@ -506,6 +555,9 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
             record_buy(wallet_address, token_mint, token_amount, sol_usd_value)
     elif action == "SOLD":
         pnl_usd, pnl_pct = record_sell(wallet_address, token_mint, token_amount, sol_usd_value)
+
+    if not _should_send_alert(token_mint, action):
+        return
 
     if telegram_bot_token and telegram_chat_ids:
         if action == "BOUGHT":
@@ -576,12 +628,11 @@ def execute_monitoring(wallet, helius_key, alerts_config):
 
             # Helius returns 404 (rather than an empty list) when a wallet has
             # no matching TRANSFER/SWAP activity within its default lookback
-            # window - that's "nothing new", not a real error, and the message
-            # says to paginate with before-signature to search further back,
-            # which we don't need for live monitoring. Log it quietly and keep
-            # the normal poll cadence instead of treating it like a real
-            # failure and backing off to 60s.
-            if resp is not None and resp.status_code == 404:
+            # window - that's "nothing new", not a real error. But a 404 can
+            # also mean something genuinely wrong (bad address, revoked key,
+            # endpoint change), so only treat it as quiet when the body
+            # actually says so - never suppress the real reason blindly.
+            if resp is not None and resp.status_code == 404 and "failed to find events" in body.lower():
                 click.echo(f"No recent transactions for {wallet_name} - {wallet_address} (nothing in Helius's search window).")
                 time.sleep(30)
                 continue
@@ -664,6 +715,8 @@ def process_transactions(wallet, transactions, alerts_config, last_processed_slo
             if not from_token or not to_token:
                 continue
             if from_token["mint"] in IGNORED_MINTS or to_token["mint"] in IGNORED_MINTS:
+                continue
+            if not _should_send_swap_alert(from_token["mint"], to_token["mint"]):
                 continue
 
             out_info = get_token_info(from_token["mint"])
