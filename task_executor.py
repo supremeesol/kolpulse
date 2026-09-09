@@ -573,6 +573,19 @@ def execute_monitoring(wallet, helius_key, alerts_config):
                     body = f" | body: {resp.text[:300]}"
                 except Exception:
                     pass
+
+            # Helius returns 404 (rather than an empty list) when a wallet has
+            # no matching TRANSFER/SWAP activity within its default lookback
+            # window - that's "nothing new", not a real error, and the message
+            # says to paginate with before-signature to search further back,
+            # which we don't need for live monitoring. Log it quietly and keep
+            # the normal poll cadence instead of treating it like a real
+            # failure and backing off to 60s.
+            if resp is not None and resp.status_code == 404:
+                click.echo(f"No recent transactions for {wallet_name} - {wallet_address} (nothing in Helius's search window).")
+                time.sleep(30)
+                continue
+
             click.echo(f"Error fetching transactions for {wallet_name} - {wallet_address}: {e}{body}")
             time.sleep(60)
 
@@ -580,7 +593,23 @@ def execute_monitoring(wallet, helius_key, alerts_config):
 def process_transactions(wallet, transactions, alerts_config, last_processed_slot):
     wallet_address = wallet["address"]
     wallet_name = wallet["name"]
-    transactions = sorted(transactions, key=lambda x: x["slot"])
+
+    # Helius's combined type=TRANSFER&type=SWAP filter can return the same
+    # signature twice in one response (once per matching type), which would
+    # otherwise fire a duplicate BOUGHT/SOLD alert for the same trade. Slot
+    # tracking alone doesn't catch this since it's a dupe *within* one batch,
+    # not across polls - so dedupe by signature first, keeping first occurrence.
+    seen_signatures = set()
+    deduped_transactions = []
+    for t in transactions:
+        sig = t.get("signature")
+        if sig and sig in seen_signatures:
+            continue
+        if sig:
+            seen_signatures.add(sig)
+        deduped_transactions.append(t)
+
+    transactions = sorted(deduped_transactions, key=lambda x: x["slot"])
 
     latest_slot = last_processed_slot
 
