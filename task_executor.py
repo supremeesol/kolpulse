@@ -85,7 +85,7 @@ def format_signed_pct(value):
 def escape_markdown(text):
     """
     Escape Telegram legacy-Markdown special characters in untrusted text
-    (token names/tickers come from Codex and can contain '_', '*', '[', etc.,
+    (token names/tickers come from DexScreener and can contain '_', '*', '[', etc.,
     which otherwise breaks Telegram's parser and causes the whole message
     to be rejected with a 400 Bad Request).
     """
@@ -231,76 +231,61 @@ def extract_sol_amount(transaction, wallet_address):
                 wsol_change += amt
     return round(max(native_change, wsol_change), 4)
 
-CODEX_GRAPHQL_URL = "https://graph.codex.io/graphql"
-SOLANA_NETWORK_ID = 1399811149
-
-CODEX_TOKEN_QUERY = """
-query GetTokenInfo($tokens: [String]) {
-  filterTokens(tokens: $tokens, limit: 1) {
-    results {
-      marketCap
-      circulatingMarketCap
-      priceUSD
-      token {
-        name
-        symbol
-      }
-    }
-  }
-}
-"""
+DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 
-def get_token_info(token_mint, codex_api_key):
+def get_token_info(token_mint):
     """
-    Look up market cap / price / name / ticker for a token via the Codex.io API.
-    Never raises - returns safe defaults on any failure (missing key, bad
-    response, no match, network error) so a single bad lookup can't crash
-    the whole monitoring loop.
+    Look up market cap / price / name / ticker for a token via the DexScreener
+    API (free, no key required). A mint can have multiple pairs/pools across
+    DEXes, so we pick the Solana pair with the highest liquidity as the most
+    representative price/market-cap source.
+
+    Never raises - returns safe defaults on any failure (bad response, no
+    match, network error) so a single bad lookup can't crash the whole
+    monitoring loop.
     """
     defaults = {"market_cap": 0, "name": "Unknown", "ticker": "N/A", "price_usd": 0}
 
-    if not codex_api_key:
-        return defaults
-
     try:
-        token_id = f"{token_mint}:{SOLANA_NETWORK_ID}"
-        resp = requests.post(
-            CODEX_GRAPHQL_URL,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": codex_api_key,
-            },
-            json={"query": CODEX_TOKEN_QUERY, "variables": {"tokens": [token_id]}},
+        resp = requests.get(
+            DEXSCREENER_TOKEN_URL.format(token_mint),
             timeout=10,
         )
         if not resp.ok:
-            click.echo(f"Codex lookup failed for {token_mint}: HTTP {resp.status_code}")
+            click.echo(f"DexScreener lookup failed for {token_mint}: HTTP {resp.status_code}")
             return defaults
 
         data = resp.json()
-        if data.get("errors"):
-            click.echo(f"Codex lookup returned errors for {token_mint}: {data['errors']}")
+        pairs = data.get("pairs") or []
+        # Only Solana pairs - the same mint address could theoretically collide
+        # with a listing on another chain.
+        pairs = [p for p in pairs if p.get("chainId") == "solana"]
+        if not pairs:
             return defaults
 
-        results = (data.get("data") or {}).get("filterTokens", {}).get("results") or []
-        if not results:
-            return defaults
+        # Pick the deepest-liquidity pool so a thin/inactive pair on some
+        # obscure DEX can't skew the reported price or market cap.
+        best_pair = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
 
-        result = results[0]
-        token = result.get("token") or {}
-        # marketCap is fully-diluted; fall back to circulatingMarketCap if unset
-        market_cap = result.get("marketCap") or result.get("circulatingMarketCap") or 0
-        price_usd = result.get("priceUSD") or 0
+        base_token = best_pair.get("baseToken") or {}
+        # marketCap on DexScreener is fully-diluted; fall back to fdv if unset
+        # (DexScreener sometimes only populates one of the two).
+        market_cap = best_pair.get("marketCap") or best_pair.get("fdv") or 0
+        price_usd = best_pair.get("priceUsd") or 0
+        try:
+            price_usd = float(price_usd)
+        except (TypeError, ValueError):
+            price_usd = 0
 
         return {
             "market_cap": market_cap,
-            "name": token.get("name") or "Unknown",
-            "ticker": token.get("symbol") or "N/A",
+            "name": base_token.get("name") or "Unknown",
+            "ticker": base_token.get("symbol") or "N/A",
             "price_usd": price_usd,
         }
     except Exception as e:
-        click.echo(f"Codex lookup failed for {token_mint}: {e}")
+        click.echo(f"DexScreener lookup failed for {token_mint}: {e}")
         return defaults
 
 
@@ -479,7 +464,7 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
         )
 
 
-def execute_monitoring(wallet, helius_key, codex_api_key, alerts_config):
+def execute_monitoring(wallet, helius_key, alerts_config):
     wallet_name = wallet["name"]
     wallet_address = wallet["address"]
 
@@ -506,7 +491,7 @@ def execute_monitoring(wallet, helius_key, codex_api_key, alerts_config):
 
             if transactions:
                 last_processed_slots[wallet_address] = process_transactions(
-                    wallet, transactions, codex_api_key, alerts_config, last_processed_slots[wallet_address]
+                    wallet, transactions, alerts_config, last_processed_slots[wallet_address]
                 )
             else:
                 click.echo(f"No new transactions for {wallet_name} ({wallet_address}).")
@@ -526,7 +511,7 @@ def execute_monitoring(wallet, helius_key, codex_api_key, alerts_config):
             time.sleep(60)
 
 
-def process_transactions(wallet, transactions, codex_api_key, alerts_config, last_processed_slot):
+def process_transactions(wallet, transactions, alerts_config, last_processed_slot):
     wallet_address = wallet["address"]
     wallet_name = wallet["name"]
     transactions = sorted(transactions, key=lambda x: x["slot"])
@@ -563,7 +548,7 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
                 if token_mint in IGNORED_MINTS or amount <= 0 or not sol_amount:
                     continue
 
-                token_info = get_token_info(token_mint, codex_api_key)
+                token_info = get_token_info(token_mint)
                 if leg.get("fromUserAccount") == wallet_address:
                     notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
                            token_mint, amount, sol_amount, signature=transaction.get("signature"))
@@ -586,8 +571,8 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
             if from_token["mint"] in IGNORED_MINTS or to_token["mint"] in IGNORED_MINTS:
                 continue
 
-            out_info = get_token_info(from_token["mint"], codex_api_key)
-            in_info = get_token_info(to_token["mint"], codex_api_key)
+            out_info = get_token_info(from_token["mint"])
+            in_info = get_token_info(to_token["mint"])
             message = (
                 f"\U0001F501 *{escape_markdown(wallet_name)}* SWAPPED\n\n"
                 f"*Sold:* {format_amount(from_token['tokenAmount'])} {escape_markdown(out_info['ticker'])}\n"
@@ -614,24 +599,24 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
                     continue
 
                 if token_transfer.get("toUserAccount") == wallet_address:
-                    token_info = get_token_info(token_mint, codex_api_key)
+                    token_info = get_token_info(token_mint)
                     notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
                            token_mint, amount, sol_amount, signature=transaction.get("signature"))
 
                 elif token_transfer.get("fromUserAccount") == wallet_address:
-                    token_info = get_token_info(token_mint, codex_api_key)
+                    token_info = get_token_info(token_mint)
                     notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
                            token_mint, amount, sol_amount, signature=transaction.get("signature"))
 
     return latest_slot
 
 
-def run_tasks_concurrently(wallets, helius_api_key, codex_api_key, alerts_config):
+def run_tasks_concurrently(wallets, helius_api_key, alerts_config):
     """Run monitoring tasks concurrently for all wallets with a small delay between task starts."""
 
     def execute_with_delay(wallet):
         time.sleep(2)
-        execute_monitoring(wallet, helius_api_key, codex_api_key, alerts_config)
+        execute_monitoring(wallet, helius_api_key, alerts_config)
 
     # Each wallet's monitoring loop runs forever (it's a `while True`), so it holds
     # its worker thread for the lifetime of the process rather than returning it to

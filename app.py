@@ -40,11 +40,8 @@ def start_tracking_background():
         wallets = load_wallets_from_env()
 
         helius_api_key = os.environ.get("HELIUS_API_KEY")
-        codex_api_key = os.environ.get("CODEX_API_KEY")
         if not helius_api_key:
             raise ValueError("HELIUS_API_KEY env var is not set")
-        if not codex_api_key:
-            raise ValueError("CODEX_API_KEY env var is not set")
 
         alerts_config = {
             "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN"),
@@ -68,7 +65,7 @@ def start_tracking_background():
         tracker_status["error"] = None
 
         print(f"[SolTracker] Starting tracking for {len(wallets)} wallet(s)", flush=True)
-        run_tasks_concurrently(wallets, helius_api_key, codex_api_key, alerts_config)
+        run_tasks_concurrently(wallets, helius_api_key, alerts_config)
 
     except Exception as e:
         tracker_status["started"] = False
