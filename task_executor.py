@@ -1,5 +1,6 @@
 import time
 import threading
+import queue
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import click
@@ -327,10 +328,33 @@ def build_sell_message(wallet_name, wallet_address, token_info, token_amount, so
     return "\n".join(lines)
 
 
+# With several wallets alerting concurrently (and multi-leg swaps firing several
+# alerts off a single transaction), every monitoring thread used to call Telegram
+# directly. Telegram allows roughly 1 msg/sec to a given chat (~20/min to a group),
+# so bursts triggered a cascade of 429s - and a 429 just got logged and the alert
+# dropped, so real buy/sell alerts silently never went out.
+#
+# To fix this, all Telegram sends go through one queue drained by a single
+# background worker, which paces sends per-chat and actually waits out
+# "retry after" instead of dropping the message.
+TELEGRAM_MIN_INTERVAL_SECONDS = 1.1  # a hair over Telegram's ~1 msg/sec-per-chat limit
+TELEGRAM_MAX_RETRIES = 5
+
+_telegram_queue = queue.Queue()
+_telegram_last_sent_at = {}  # keyed by (bot_token, chat_id) -> monotonic timestamp of last send
+
+
 def send_telegram_notification(bot_token, chat_id, message, reply_markup=None):
-    """Send a message to a Telegram chat via the Bot API, optionally with an inline keyboard."""
+    """Queue a Telegram message for sending; never blocks the caller and never
+    drops a message just because Telegram is momentarily rate-limiting us."""
     if not bot_token or not chat_id:
         return
+    _telegram_queue.put((bot_token, chat_id, message, reply_markup))
+
+
+def _post_telegram_message(bot_token, chat_id, message, reply_markup):
+    """One raw attempt at the Telegram sendMessage call.
+    Returns (ok, retry_after_seconds). retry_after_seconds is set only on a 429."""
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
@@ -342,6 +366,13 @@ def send_telegram_notification(bot_token, chat_id, message, reply_markup=None):
         if reply_markup:
             payload["reply_markup"] = reply_markup
         response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 429:
+            try:
+                retry_after = float(response.json().get("parameters", {}).get("retry_after", 5))
+            except (ValueError, TypeError):
+                retry_after = 5
+            click.echo(f"Telegram API error 429: rate limited, retry after {retry_after:g}s")
+            return False, retry_after
         if not response.ok:
             # Telegram puts the real reason (e.g. "can't parse entities") in the
             # JSON body, not the status line, so log that instead of just the code.
@@ -350,11 +381,46 @@ def send_telegram_notification(bot_token, chat_id, message, reply_markup=None):
             except ValueError:
                 detail = response.text
             click.echo(f"Telegram API error {response.status_code}: {detail}")
-        response.raise_for_status()
+            return False, None
+        return True, None
     except requests.RequestException:
         # Avoid ever logging the bot token, which requests.RequestException's
         # str(e) includes as part of the request URL.
         click.echo("Error sending Telegram notification (request failed)")
+        return False, None
+
+
+def _telegram_sender_worker():
+    """Drains the Telegram queue forever, one message at a time, spacing
+    consecutive sends to the same chat and waiting out 429s instead of
+    dropping the alert."""
+    while True:
+        bot_token, chat_id, message, reply_markup = _telegram_queue.get()
+        try:
+            key = (bot_token, chat_id)
+            last_sent = _telegram_last_sent_at.get(key)
+            if last_sent is not None:
+                wait = TELEGRAM_MIN_INTERVAL_SECONDS - (time.monotonic() - last_sent)
+                if wait > 0:
+                    time.sleep(wait)
+
+            for attempt in range(TELEGRAM_MAX_RETRIES):
+                ok, retry_after = _post_telegram_message(bot_token, chat_id, message, reply_markup)
+                _telegram_last_sent_at[key] = time.monotonic()
+                if ok:
+                    break
+                if retry_after is None:
+                    # Non-429 failure (bad request, network error) - retrying won't help.
+                    break
+                if attempt < TELEGRAM_MAX_RETRIES - 1:
+                    time.sleep(retry_after)
+            else:
+                click.echo("Telegram alert dropped after repeated rate-limit retries")
+        finally:
+            _telegram_queue.task_done()
+
+
+threading.Thread(target=_telegram_sender_worker, daemon=True).start()
 
 
 def send_discord_notification(webhook_url, wallet_name, wallet_address, action, token_mint,
